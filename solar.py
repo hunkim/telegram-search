@@ -190,6 +190,12 @@ Keep your tone friendly but efficient.
             words = re.findall(r'\b\w+\b', text.lower())
             return set(word for word in words if word not in stop_words and len(word) > 1)
 
+        # --- Dynamic Threshold Setup ---
+        initial_threshold = 4  # Start with the desired "high relevance" threshold
+        min_threshold = 2      # Minimum acceptable overlap to avoid excessive noise (adjust if needed)
+        current_threshold = initial_threshold
+        # -----------------------------
+
         # Prepare sources with numbers and pre-process content
         numbered_sources = []
         source_details_map = {} # Map original number to details for later lookup
@@ -211,55 +217,88 @@ Keep your tone friendly but efficient.
 
         # Split text into sentences
         sentences = re.split(r'(?<=[.!?])\s+', response_text)
-        # List to hold sentences and their tentatively assigned *original* citation numbers
-        sentences_with_original_citations = []
-        overlap_threshold = 5 # Your chosen threshold
 
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
-
-            sentence_words = get_words(sentence)
-            if not sentence_words:
-                 sentences_with_original_citations.append({"text": sentence, "citations": []})
-                 continue
-
-            matching_source_nums = []
-            for source in numbered_sources:
-                overlap = sentence_words.intersection(source["content_words"])
-                if len(overlap) >= overlap_threshold:
-                    matching_source_nums.append(source["number"])
-
-            # Sort original numbers for consistent intermediate representation
-            matching_source_nums.sort()
-            sentences_with_original_citations.append({
-                "text": sentence,
-                "citations": matching_source_nums # Store original numbers
-            })
-
-        # --- Reordering Logic ---
-        final_cited_sentences = []
-        old_to_new_mapping = OrderedDict() # Use OrderedDict to maintain insertion order
-        next_new_citation_num = 1
+        # --- Loop for Dynamic Threshold ---
+        final_sentences_with_citations = [] # Store results from the successful pass
         
-        # First pass: Find unique citations in order of appearance and build mapping
-        for sentence_data in sentences_with_original_citations:
+        while current_threshold >= min_threshold:
+            print(f"Attempting citation with threshold: {current_threshold}") # Logging/Debug
+            
+            # Reset results for this specific threshold attempt
+            current_pass_sentences = []
+            any_citations_found_this_pass = False
+
+            for sentence in sentences:
+                if not sentence.strip():
+                    continue
+
+                sentence_words = get_words(sentence)
+                # Add sentence structure even if no words or no citations found later
+                sentence_entry = {"text": sentence, "citations": []}
+
+                if not sentence_words:
+                     current_pass_sentences.append(sentence_entry)
+                     continue
+
+                matching_source_nums = []
+                for source in numbered_sources:
+                    overlap = sentence_words.intersection(source["content_words"])
+                    # Use the *current* threshold for checking
+                    if len(overlap) >= current_threshold:
+                        matching_source_nums.append(source["number"])
+                        any_citations_found_this_pass = True # Mark success for this pass
+
+                # Sort original numbers for consistent intermediate representation
+                matching_source_nums.sort()
+                sentence_entry["citations"] = matching_source_nums
+                current_pass_sentences.append(sentence_entry)
+
+            # Check if citations were found in this pass
+            if any_citations_found_this_pass:
+                print(f"Found citations at threshold {current_threshold}. Using these results.") # Logging/Debug
+                final_sentences_with_citations = current_pass_sentences # Store the successful results
+                break # Exit the while loop, we found citations
+            else:
+                print(f"No citations found at threshold {current_threshold}. Decreasing threshold.") # Logging/Debug
+                current_threshold -= 1
+                # Continue to the next iteration of the while loop with lower threshold
+
+        # Handle case where loop finished without finding any citations
+        if not final_sentences_with_citations:
+             print(f"No citations found even at minimum threshold {min_threshold}. Proceeding without citations.") # Logging/Debug
+             # Populate with original sentences and empty citations if loop failed
+             final_sentences_with_citations = [{"text": s, "citations": []} for s in sentences if s.strip()]
+        # --- End Dynamic Threshold Loop ---
+
+        # --- Reordering Logic (Uses final_sentences_with_citations) ---
+        # This part remains largely the same, but uses the list determined by the dynamic threshold loop
+        final_cited_sentences = []
+        old_to_new_mapping = OrderedDict()
+        next_new_citation_num = 1
+
+        # First pass: Find unique citations in order of appearance
+        for sentence_data in final_sentences_with_citations: # Use the final list
             for original_num in sentence_data["citations"]:
                 if original_num not in old_to_new_mapping:
                     old_to_new_mapping[original_num] = next_new_citation_num
                     next_new_citation_num += 1
 
         # Second pass: Replace original numbers with new sequential numbers
-        for sentence_data in sentences_with_original_citations:
+        for sentence_data in final_sentences_with_citations: # Use the final list
             original_sentence_text = sentence_data["text"]
-            new_citation_nums = [old_to_new_mapping[orig_num] for orig_num in sentence_data["citations"]]
+            # Use .get() default to handle potential empty list if no citations found at all
+            new_citation_nums = [old_to_new_mapping.get(orig_num) for orig_num in sentence_data["citations"]]
+            # Filter out None values in case of unexpected issue, though should not happen with current logic
+            new_citation_nums = [num for num in new_citation_nums if num is not None]
+
 
             if new_citation_nums:
-                # Sort the *new* numbers for consistent display (e.g., [1][3], not [3][1])
+                # Sort the *new* numbers for consistent display
                 new_citation_nums.sort()
-                citation_str = "".join([f"[{num}]" for num in new_citation_nums])
+                # Add space before the first citation only, then no spaces between consecutive citations
+                citation_str = f" [" + "][".join([str(num) for num in new_citation_nums]) + "]"
 
-                # Insert citation before trailing punctuation (same logic as before)
+                # Insert citation before trailing punctuation
                 sentence_strip = original_sentence_text.rstrip()
                 trailing_punctuation = ""
                 if sentence_strip and sentence_strip[-1] in '.!?':
@@ -426,9 +465,6 @@ Only add citations when there's a clear match between the text and sources. Retu
                 pass
         
         return full_content
-
-solar = SolarAPI()
-
 
 
 def extract_search_queries(user_prompt, max_attempts=3):
