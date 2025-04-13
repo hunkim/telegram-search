@@ -210,7 +210,7 @@ Keep your tone friendly but efficient.
         sentences = re.split(r'(?<=[.!?])\s+', response_text)
         cited_sentences = []
         used_source_numbers = set()
-        overlap_threshold = 3 # Number of overlapping non-stop words to trigger citation
+        overlap_threshold = 5 # Number of overlapping non-stop words to trigger citation
 
         for sentence in sentences:
             if not sentence.strip():
