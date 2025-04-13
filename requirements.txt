@@ -1,0 +1,4 @@
+requests
+sseclient-py
+python-telegram-bot
+tavily-python

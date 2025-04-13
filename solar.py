@@ -1,0 +1,667 @@
+import requests
+import json
+import sseclient
+import os
+from datetime import datetime
+
+class SolarAPI:
+    def __init__(self, api_key=os.getenv("UPSTAGE_API_KEY")):
+        """Initialize the SolarAPI client with the API key.
+        
+        Args:
+            api_key (str): Your Upstage API key
+        """
+        self.api_key = api_key
+        self.base_url = "https://api.upstage.ai/v1/chat/completions"
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+    
+    def complete(self, prompt, model="solar-mini-nightly", stream=False, on_update=None, search_grounding=False, return_sources=False, search_done_callback=None):
+        """Send a completion request to the Solar API.
+        
+        Args:
+            prompt (str): The user's input prompt
+            model (str): The model to use
+            stream (bool): Whether to stream the response
+            on_update (callable): Function to call with each update when streaming
+                                 Should accept one argument (the new token/content)
+            search_grounding (bool): Whether to ground responses using Tavily search results
+            return_sources (bool): Whether to return search result sources along with the response
+            search_done_callback (callable): Function to call when search is completed
+                                           Should accept one argument (the search results)
+        
+        Returns:
+            str or dict: The complete response text (non-streaming) or a dict with response and sources if return_sources=True
+        """
+        # If search grounding is enabled, use search results to augment the prompt
+        sources = []
+        if search_grounding:
+            try:
+                from tavily import TavilyClient
+                tavily_api_key = os.getenv("TAVILY_API_KEY")
+                if not tavily_api_key:
+                    raise ValueError("TAVILY_API_KEY environment variable is not set")
+                
+                # Get search queries from the prompt
+                if False:
+                    queries_json = extract_search_queries(prompt)
+                    queries = json.loads(queries_json)["search_queries"]
+                    print(f"Search queries: {queries}")
+                else:
+                    queries = [prompt]
+
+                # Initialize Tavily client
+                tavily_client = TavilyClient(tavily_api_key)
+                
+                # Collect search results for each query
+                all_search_results = []
+                for query in queries[:3]:
+                    search_response = tavily_client.search(
+                        query=query,
+                        max_results=10,
+                        include_raw_content=True,
+                        # topic="news",
+                    )
+                    all_search_results.extend(search_response.get('results', []))
+                
+                # Format search results as context
+                search_context = ""
+                for i, result in enumerate(all_search_results, 1):  # Limit to top 10 results
+                    title = result.get('title', 'No Title')
+                    content = result.get('content', result.get('raw_content', 'No Content'))
+                    url = result.get('url', 'No URL')
+                    search_context += f"[{i}]. {title}\n{content}\n\n"
+                    
+                    # Save source metadata for return if needed
+                    sources.append({
+                        "id": i,
+                        "title": title,
+                        "url": url,
+                        "content": content,
+                        "score": result.get('score', 0),
+                        "published_date": result.get('published_date', 'No Date')
+                    })
+                
+                # Create a grounded prompt with the search results
+                grounded_prompt = f"""Use the following search results to help answer the user's question.
+---                
+SEARCH RESULTS:
+{search_context}
+---
+USER QUESTION: {prompt}
+
+---
+IMPORTANT INSTRUCTIONS:
+1. Respond in the SAME LANGUAGE as the user's question. If the question is in Korean, respond in Korean.
+2. Be BRIEF and CONCISE - this is for Telegram, so get to the point clearly.
+3. Make FULL USE of the search results and cite relevant information.
+4. Consider TIME-SENSITIVITY - today's date is {datetime.now().strftime("%Y-%m-%d")}.
+
+Provide a direct, informative answer based on the search results. If the search results don't contain relevant information, briefly state that you don't have sufficient information to answer the question.
+
+Keep your tone friendly but efficient.
+"""
+                
+                prompt = grounded_prompt
+                
+                # Call the search done callback if provided
+                if search_done_callback:
+                    search_done_callback(sources)
+                    
+            except Exception as e:
+                print(f"Search grounding failed: {str(e)}. Falling back to standard completion.")
+                # Call the callback with empty results if there was an error
+                if search_done_callback:
+                    search_done_callback([])
+        
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "stream": stream
+        }
+
+        if stream:
+            response_text = self._stream_request(payload, on_update)
+        else:
+            response_text = self._standard_request(payload)
+            
+        # Return response with sources if requested
+        if return_sources and search_grounding:
+            return {
+                "response": response_text,
+                "sources": sources
+            }
+        else:
+            return response_text
+        
+
+    def fill_citation(self, response_text, sources, model="solar-mini-nightly"):
+        prompt = f"""Analyze the following response text and identify which parts are derived from the provided sources. Then add citation numbers accordingly.
+
+RESPONSE TEXT:
+{response_text}
+
+SOURCES:
+{json.dumps(sources, indent=2)}
+
+INSTRUCTIONS:
+1. Carefully read the response text and all sources.
+2. Identify specific passages in the response that are derived from any of the sources.
+3. Add citation numbers in square brackets [1], [2], etc. at the end of each statement or paragraph that uses information from the sources.
+4. Do NOT alter the original response text in any other way - only add citation numbers.
+5. Create a list of references that includes:
+   - Citation number
+   - Full URL
+   - A brief snippet (max one line) from the source that supports the citation
+6. Return the results as a valid JSON object with the following structure:
+   {{
+     "cited_text": "the response text with added citation numbers",
+     "references": [
+       {{
+         "number": 1,
+         "url": "https://example.com/source1",
+         "snippet": "Brief supporting quote from the source (max one line)"
+       }},
+       ...
+     ]
+   }}
+
+EXAMPLES:
+
+EXAMPLE 1:
+Response: "The iPhone 15 Pro features a titanium frame and comes with the new A17 Pro chip. It also includes a 48-megapixel camera with improved low-light performance."
+
+Sources: [
+  {{"id": 1, "title": "iPhone 15 Pro Review", "url": "https://example.com/review1", "content": "Apple's iPhone 15 Pro features a titanium frame, making it lighter and more durable than previous models."}},
+  {{"id": 2, "title": "A17 Pro Benchmarks", "url": "https://example.com/benchmarks", "content": "The new A17 Pro chip in iPhone 15 Pro delivers 20% faster performance than its predecessor."}},
+  {{"id": 3, "title": "Camera Comparison", "url": "https://example.com/cameras", "content": "With its 48-megapixel main camera, the iPhone 15 Pro captures remarkable detail even in low-light conditions."}}
+]
+
+Output:
+{{
+  "cited_text": "The iPhone 15 Pro features a titanium frame[1] and comes with the new A17 Pro chip.[2] It also includes a 48-megapixel camera with improved low-light performance.[3]",
+  "references": [
+    {{
+      "number": 1,
+      "url": "https://example.com/review1",
+      "snippet": "Apple's iPhone 15 Pro features a titanium frame, making it lighter and more durable than previous models."
+    }},
+    {{
+      "number": 2,
+      "url": "https://example.com/benchmarks",
+      "snippet": "The new A17 Pro chip in iPhone 15 Pro delivers 20% faster performance than its predecessor."
+    }},
+    {{
+      "number": 3,
+      "url": "https://example.com/cameras",
+      "snippet": "With its 48-megapixel main camera, the iPhone 15 Pro captures remarkable detail even in low-light conditions."
+    }}
+  ]
+}}
+
+EXAMPLE 2:
+Response: "Climate change is accelerating with global temperatures rising. In the Arctic, ice is melting at an unprecedented rate, which contributes to rising sea levels. Many coastal cities are now implementing adaptation strategies."
+
+Sources: [
+  {{"id": 1, "title": "IPCC Report 2023", "url": "https://example.com/ipcc", "content": "Global temperatures have risen by 1.1°C since pre-industrial times, with the rate of warming accelerating in recent decades."}},
+  {{"id": 2, "title": "Arctic Ice Study", "url": "https://example.com/arctic", "content": "Arctic sea ice is now declining at a rate of 13.1% per decade, relative to the 1981-2010 average."}},
+  {{"id": 3, "title": "Sea Level Rise", "url": "https://example.com/sealevel", "content": "Sea levels rose by 20cm in the last century and are now rising at 3.7mm per year."}}
+]
+
+Output:
+{{
+  "cited_text": "Climate change is accelerating with global temperatures rising.[1] In the Arctic, ice is melting at an unprecedented rate,[2] which contributes to rising sea levels.[3] Many coastal cities are now implementing adaptation strategies.",
+  "references": [
+    {{
+      "number": 1,
+      "url": "https://example.com/ipcc",
+      "snippet": "Global temperatures have risen by 1.1°C since pre-industrial times, with the rate of warming accelerating in recent decades."
+    }},
+    {{
+      "number": 2,
+      "url": "https://example.com/arctic",
+      "snippet": "Arctic sea ice is now declining at a rate of 13.1% per decade, relative to the 1981-2010 average."
+    }},
+    {{
+      "number": 3,
+      "url": "https://example.com/sealevel",
+      "snippet": "Sea levels rose by 20cm in the last century and are now rising at 3.7mm per year."
+    }}
+  ]
+}}
+
+EXAMPLE 3:
+Response: "Python has been gaining popularity in recent years due to its simplicity and wide range of applications. Some developers prefer JavaScript for web development."
+
+Sources: [
+  {{"id": 1, "title": "Programming Language Survey", "url": "https://example.com/survey", "content": "Python has seen a 456% growth in popularity among developers between 2015 and 2023."}},
+  {{"id": 2, "title": "Web Dev Trends", "url": "https://example.com/webdev", "content": "Despite Python's growth, JavaScript remains the most used language for front-end web development."}}
+]
+
+Output:
+{{
+  "cited_text": "Python has been gaining popularity in recent years due to its simplicity and wide range of applications.[1] Some developers prefer JavaScript for web development.[2]",
+  "references": [
+    {{
+      "number": 1,
+      "url": "https://example.com/survey",
+      "snippet": "Python has seen a 456% growth in popularity among developers between 2015 and 2023."
+    }},
+    {{
+      "number": 2,
+      "url": "https://example.com/webdev",
+      "snippet": "Despite Python's growth, JavaScript remains the most used language for front-end web development."
+    }}
+  ]
+}}
+
+IMPORTANT: Only add citations where there is a clear match between the response text and a source. Do not invent or fabricate citations. Make sure to return valid JSON that can be parsed.
+"""
+
+        citation_added_response = self.complete(
+            prompt=prompt,
+            model=model,
+            stream=False
+        )
+        return citation_added_response
+    
+    def _standard_request(self, payload):
+        """Make a standard non-streaming request."""
+        response = requests.post(
+            self.base_url,
+            headers=self.headers,
+            json=payload
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
+    
+    def _stream_request(self, payload, on_update):
+        """Make a streaming request and process the server-sent events."""
+        response = requests.post(
+            self.base_url,
+            headers=self.headers,
+            json=payload,
+            stream=True
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
+        
+        # Create an SSE client from the response
+        client = sseclient.SSEClient(response)
+        
+        # Full content accumulated across all chunks
+        full_content = ""
+        
+        for event in client.events():
+            if event.data == "[DONE]":
+                break
+                
+            try:
+                chunk = json.loads(event.data)
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        content = delta["content"]
+                        full_content += content
+                        
+                        # Call the callback function with the new content
+                        if on_update:
+                            on_update(content)
+            except json.JSONDecodeError:
+                pass
+        
+        return full_content
+
+solar = SolarAPI()
+
+
+
+def extract_search_queries(user_prompt, max_attempts=3):
+    """
+    Extract 2-3 optimal search queries from a user prompt to maximize search engine relevance.
+    
+    Args:
+        user_prompt (str): The user's input prompt/question
+        max_attempts (int): Maximum number of attempts to get valid JSON response
+        
+    Returns:
+        str: JSON formatted string containing 2-3 search queries
+    """
+    prompt = f"""
+    Given the following user question or request, generate 2-3 different search queries that would help retrieve the most relevant information from a search engine.
+
+    IMPORTANT RULES:
+    1. If the request involves a comparison (e.g., "A vs B" or "differences between X and Y"), create separate queries for each component individually (e.g., one query about A, one query about B)
+    2. For multi-part questions, divide your queries to address each component separately
+    3. Break down complex topics into their fundamental elements
+    
+    Your search queries should:
+    - Extract key concepts and technical terms
+    - Remove filler words and focus on essential keywords
+    - Be concise and directly relevant to the information need
+    - Include specific technical terminology where appropriate
+    
+    User request: "{user_prompt}"
+    
+    Examples:
+    - User: "How do I implement a binary search tree in Python?"
+      Queries: ["python binary search tree implementation", "BST data structure python code", "binary tree algorithms python"]
+    
+    - User: "What are the advantages of React over Angular for building web applications?"
+      Queries: ["React framework features benefits", "Angular framework capabilities", "React vs Angular performance"]
+    
+    - User: "Explain the difference between supervised and unsupervised machine learning"
+      Queries: ["supervised learning algorithms principles", "unsupervised learning methods examples", "machine learning types comparison"]
+      
+    - User: "Compare AWS Lambda and Google Cloud Functions for serverless applications"
+      Queries: ["AWS Lambda serverless features", "Google Cloud Functions capabilities", "serverless platform comparison criteria"]
+    
+    Return ONLY a JSON object with this format:
+    {{"search_queries": ["query1", "query2", "query3"]}}
+    """
+    
+    # Make multiple attempts to get valid JSON
+    for attempt in range(max_attempts):
+        try:
+            # Get completion from Solar API
+            response = solar.complete(prompt, model="solar-mini-nightly", stream=False)
+            
+            # Try to parse as JSON
+            queries = json.loads(response)
+            
+            # Validate the structure - make sure it has search_queries field
+            if "search_queries" not in queries:
+                queries = {"search_queries": list(queries.values())[0] if queries else [user_prompt]}
+            
+            # Ensure we have at most 3 queries
+            queries["search_queries"] = queries["search_queries"][:3]
+            
+            # Return properly formatted JSON
+            return json.dumps(queries, indent=2)
+            
+        except (json.JSONDecodeError, KeyError, IndexError):
+            # If this is the last attempt, we'll fall through to the backup method
+            if attempt == max_attempts - 1:
+                break
+            
+            # Otherwise, modify the prompt to emphasize JSON formatting
+            prompt += "\n\nIMPORTANT: Return ONLY a valid JSON object with the format {\"search_queries\": [\"query1\", \"query2\", \"query3\"]}. No other text."
+    
+    # Backup method: extract potential queries using regex
+    import re
+    
+    # Look for quoted strings that might be our queries
+    queries = re.findall(r'"([^"]*)"', response)
+    
+    # If we couldn't find any quoted strings, try looking for text between brackets
+    if not queries:
+        bracket_content = re.search(r'\[(.*?)\]', response)
+        if bracket_content:
+            queries = [q.strip().strip('"\'') for q in bracket_content.group(1).split(',')]
+    
+    # If all extraction methods failed, use the original prompt as a single query
+    if not queries:
+        queries = [user_prompt]
+    
+    # Ensure we have 2-3 queries (take up to 3)
+    queries = queries[:3]
+    
+    # If we have fewer than 2 queries, add variations of the first query
+    while len(queries) < 2 and queries:
+        queries.append(f"alternative {queries[0]}")
+    
+    return json.dumps({"search_queries": queries}, indent=2)
+
+# Example usage
+if __name__ == "__main__":
+    import os
+    
+    # Get API key from environment variable
+    api_key = os.environ.get("UPSTAGE_API_KEY")
+    
+    if not api_key:
+        api_key = input("Enter your Upstage API key: ")
+    
+    solar = SolarAPI(api_key)
+    
+    # Test cases for extract_search_queries function
+    print("\n=== TESTING SEARCH QUERY EXTRACTION ===")
+    
+    test_prompts = [
+        "What are the best practices for deploying a Django application to AWS?",
+        "Explain how quantum computing works and its potential applications in cryptography",
+        "How do I fix a memory leak in my Node.js application?",
+        "What are the differences between deep learning and traditional machine learning algorithms?",
+        "Give me a recipe for vegetarian lasagna with spinach",
+        "민주당과 국민의 힘 경선 일정은 어떻게 돼?"
+    ]
+    
+    for i, prompt in enumerate(test_prompts, 1):
+        print(f"\nTest Case #{i}: \"{prompt}\"")
+        queries_json = extract_search_queries(prompt)
+        print("Search Queries:")
+        print(queries_json)
+        
+        # Validate that the output is proper JSON
+        try:
+            queries = json.loads(queries_json)
+            num_queries = len(queries.get("search_queries", []))
+            print(f"✓ Valid JSON with {num_queries} queries")
+        except json.JSONDecodeError:
+            print("✗ Invalid JSON output")
+    
+    # Check if TAVILY_API_KEY is available for grounding tests
+    tavily_api_key = os.environ.get("TAVILY_API_KEY")
+    if tavily_api_key:
+        print("\n=== TESTING SEARCH GROUNDING ===")
+        
+        grounding_test_prompts = [
+            "What are the latest developments in the Ukraine-Russia conflict?",
+            "Tell me about recent advances in AI and their ethical implications",
+            "What is the current status of climate change legislation?",
+            "How did the stock market perform yesterday?",
+            "민주당과 국민의 힘 경선 일정은 언제인가요?",  # Korean: "When are the Democratic Party and People Power Party primaries?"
+            "What are the best Python libraries for data visualization in 2024?"
+        ]
+        
+        for i, prompt in enumerate(grounding_test_prompts, 1):
+            print(f"\nGrounding Test #{i}: \"{prompt}\"")
+            print("Requesting grounded response with sources...")
+            
+            try:
+                # Get grounded response with sources (non-streaming)
+                response_data = solar.complete(prompt, search_grounding=True, return_sources=True)
+                
+                # Extract response and sources
+                response_text = response_data["response"]
+                sources = response_data["sources"]
+                
+                # Print the first 300 characters of the response to keep output manageable
+                print("\nGrounded Response (excerpt):")
+                print(response_text[:300] + "..." if len(response_text) > 300 else response_text)
+                print(f"\nFull response length: {len(response_text)} characters")
+                
+                # Print source information
+                print("\nSources used for grounding:")
+                for source in sources[:3]:  # Show first 3 sources
+                    print(f"  [{source['id']}] {source['title']}")
+                    print(f"      URL: {source['url']}")
+                    print(f"      Published: {source['published_date']}")
+                    print(f"      Relevance score: {source['score']}")
+                
+                if len(sources) > 3:
+                    print(f"  ... and {len(sources) - 3} more sources")
+                    
+                print("✓ Grounding test with sources successful")
+            except Exception as e:
+                print(f"✗ Grounding test failed: {str(e)}")
+        
+        # Add test cases for citation functionality
+        print("\n=== TESTING CITATION FUNCTIONALITY ===")
+        
+        citation_test_cases = [
+            {
+                "description": "Tech news with multiple sources",
+                "response": "The iPhone 15 Pro Max has been well-received by reviewers, with particular praise for its camera system and battery life. The device features a new A17 Pro chip and a titanium frame, making it lighter than previous models.",
+                "sources": [
+                    {
+                        "id": 1,
+                        "title": "iPhone 15 Pro Review",
+                        "url": "https://example.com/tech/iphone15-review",
+                        "content": "The iPhone 15 Pro Max features the new A17 Pro chip, which Apple claims is the fastest mobile processor on the market.",
+                        "published_date": "2023-09-22"
+                    },
+                    {
+                        "id": 2,
+                        "title": "iPhone 15 Camera Test",
+                        "url": "https://example.com/tech/iphone15-camera",
+                        "content": "In our extensive testing, the iPhone 15 Pro Max camera system outperformed all competitors in low-light photography.",
+                        "published_date": "2023-09-25"
+                    },
+                    {
+                        "id": 3,
+                        "title": "Apple's New Materials",
+                        "url": "https://example.com/tech/apple-titanium",
+                        "content": "The switch to titanium for the iPhone 15 Pro frame reduces the weight by 10% compared to the stainless steel used in the iPhone 14 Pro.",
+                        "published_date": "2023-09-20"
+                    }
+                ]
+            },
+            {
+                "description": "Scientific article with partial citations",
+                "response": "Recent studies have shown that regular exercise can reduce the risk of heart disease by up to 30%. Daily meditation has also been linked to lower stress levels and improved cognitive function. However, the relationship between diet and longevity remains complex and requires further research.",
+                "sources": [
+                    {
+                        "id": 1,
+                        "title": "Exercise and Heart Health",
+                        "url": "https://example.com/health/exercise-heart",
+                        "content": "A meta-analysis of 25 studies found that regular physical activity reduced the risk of cardiovascular disease by 25-30% in previously sedentary individuals.",
+                        "published_date": "2022-11-15"
+                    },
+                    {
+                        "id": 2,
+                        "title": "Meditation Benefits",
+                        "url": "https://example.com/health/meditation-brain",
+                        "content": "Daily meditation practices of 20 minutes or more have been shown to reduce cortisol levels by 15% and improve performance on cognitive tasks.",
+                        "published_date": "2023-03-10"
+                    }
+                ]
+            },
+            {
+                "description": "News article with no relevant sources",
+                "response": "Local authorities announced yesterday that the downtown revitalization project will begin next month. The project is expected to take 18 months to complete and will include new pedestrian walkways and green spaces.",
+                "sources": [
+                    {
+                        "id": 1,
+                        "title": "City Budget Allocation",
+                        "url": "https://example.com/city/budget-2023",
+                        "content": "The city council approved the annual budget with major allocations for infrastructure and education.",
+                        "published_date": "2023-01-15"
+                    },
+                    {
+                        "id": 2,
+                        "title": "Traffic Pattern Changes",
+                        "url": "https://example.com/city/traffic-updates",
+                        "content": "Due to construction on Highway 101, commuters should expect delays during morning rush hour for the next three weeks.",
+                        "published_date": "2023-05-22"
+                    }
+                ]
+            }
+        ]
+        
+        for i, test_case in enumerate(citation_test_cases, 1):
+            print(f"\nCitation Test #{i}: {test_case['description']}")
+            print("\nOriginal Response:")
+            print(test_case['response'])
+            print("\nSources Available:")
+            for source in test_case['sources']:
+                print(f"  [{source['id']}] {source['title']} - {source['url']}")
+            
+            try:
+                # Get cited response
+                print("\nProcessing citations...")
+                cited_response = solar.fill_citation(
+                    response_text=test_case['response'],
+                    sources=test_case['sources']
+                )
+                
+                print("\nCited Response Result:")
+                
+                # Try to parse the result as JSON
+                try:
+                    cited_data = json.loads(cited_response)
+                    print("\nCited Text:")
+                    print(cited_data.get("cited_text", "No cited text found"))
+                    
+                    print("\nReferences:")
+                    for ref in cited_data.get("references", []):
+                        print(f"  [{ref.get('number')}] {ref.get('url')}")
+                        print(f"      \"{ref.get('snippet')}\"")
+                    
+                    print(f"\n✓ Successfully parsed citation result as JSON with {len(cited_data.get('references', []))} references")
+                except json.JSONDecodeError:
+                    # If not JSON, just print the raw result
+                    print("Raw result (not valid JSON):")
+                    print(cited_response)
+                    print("\n✗ Failed to parse result as JSON")
+            
+            except Exception as e:
+                print(f"\n✗ Citation test failed: {str(e)}")
+    
+    print("\n=== ORIGINAL API EXAMPLES ===")
+    
+    # Example for non-streaming request
+    prompt = "What is the capital of France?"
+    response = solar.complete(prompt, stream=False)
+    print("\nNon-streaming response:")
+    print(response)
+    
+    # Example for streaming request
+    print("\nStreaming response:")
+    
+    def print_update(content):
+        print(content, end="", flush=True)
+    
+    solar.complete(prompt, stream=True, on_update=print_update)
+    print("\n")
+    
+    # Example for grounding with sources (if Tavily API key is available)
+    if tavily_api_key:
+        print("\n=== DETAILED GROUNDING EXAMPLE ===")
+        prompt = "What were the major tech announcements at CES this year?"
+        
+        print(f"Question: {prompt}")
+        print("Requesting grounded response with sources...")
+        
+        response_data = solar.complete(prompt, search_grounding=True, return_sources=True)
+        
+        print("\nResponse:")
+        print(response_data["response"])
+        
+        print("\nSources:")
+        for source in response_data["sources"]:
+            print(f"[{source['id']}] {source['title']}")
+            print(f"    URL: {source['url']}")
+            print(f"    Date: {source['published_date']}")
+        
+        # Example for streaming with grounding
+        print("\nStreaming response with grounding:")
+        prompt = "What are the trending programming languages in 2024?"
+        
+        def print_grounded_update(content):
+            print(content, end="", flush=True)
+        
+        solar.complete(prompt, stream=True, on_update=print_grounded_update, search_grounding=True)
+        print("\n")
