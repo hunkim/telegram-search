@@ -143,126 +143,60 @@ Keep your tone friendly but efficient.
         
 
     def fill_citation(self, response_text, sources, model="solar-mini-nightly"):
-        prompt = f"""Analyze the following response text and identify which parts are derived from the provided sources. Then add citation numbers accordingly.
-
+        prompt = f"""Add citation numbers to the response text where information comes from the provided sources.
+---
 RESPONSE TEXT:
 {response_text}
-
+---
 SOURCES:
 {json.dumps(sources, indent=2)}
-
+---
 INSTRUCTIONS:
-1. Carefully read the response text and all sources.
-2. Identify specific passages in the response that are derived from any of the sources.
-3. Add citation numbers in square brackets [1], [2], etc. at the end of each statement or paragraph that uses information from the sources.
-4. Do NOT alter the original response text in any other way - only add citation numbers.
-5. Create a list of references that includes:
-   - Citation number
-   - Full URL
-   - A brief snippet (max one line) from the source that supports the citation
-6. Return the results as a valid JSON object with the following structure:
+1. Read the response text and sources carefully.
+2. Add citation numbers [1], [2], etc. after statements that use information from the sources.
+3. Only add citation numbers - don't change the original text otherwise.
+4. IMPORTANT: Copy URLs EXACTLY as they appear in the sources - URLs must be precise and complete.
+5. Return a JSON object with this structure:
    {{
-     "cited_text": "the response text with added citation numbers",
+     "cited_text": "text with added citation numbers",
      "references": [
        {{
          "number": 1,
-         "url": "https://example.com/source1",
-         "snippet": "Brief supporting quote from the source (max one line)"
-       }},
-       ...
+         "url": "https://example.com/source1"
+       }}
      ]
    }}
 
-EXAMPLES:
+EXAMPLE:
 
-EXAMPLE 1:
-Response: "The iPhone 15 Pro features a titanium frame and comes with the new A17 Pro chip. It also includes a 48-megapixel camera with improved low-light performance."
+Response: "The iPhone 15 Pro features a titanium frame and a 48-megapixel camera."
 
 Sources: [
-  {{"id": 1, "title": "iPhone 15 Pro Review", "url": "https://example.com/review1", "content": "Apple's iPhone 15 Pro features a titanium frame, making it lighter and more durable than previous models."}},
-  {{"id": 2, "title": "A17 Pro Benchmarks", "url": "https://example.com/benchmarks", "content": "The new A17 Pro chip in iPhone 15 Pro delivers 20% faster performance than its predecessor."}},
-  {{"id": 3, "title": "Camera Comparison", "url": "https://example.com/cameras", "content": "With its 48-megapixel main camera, the iPhone 15 Pro captures remarkable detail even in low-light conditions."}}
+  {{"id": 1, "title": "iPhone 15 Pro Review", "url": "https://example.com/review1", "content": "Apple's iPhone 15 Pro features a titanium frame, making it lighter than previous models."}},
+  {{"id": 3, "title": "Camera Comparison", "url": "https://example.com/cameras", "content": "With its 48-megapixel main camera, the iPhone 15 Pro captures remarkable detail."}}
 ]
 
 Output:
 {{
-  "cited_text": "The iPhone 15 Pro features a titanium frame[1] and comes with the new A17 Pro chip.[2] It also includes a 48-megapixel camera with improved low-light performance.[3]",
+  "cited_text": "The iPhone 15 Pro features a titanium frame[1] and a 48-megapixel camera.[2]",
   "references": [
     {{
       "number": 1,
-      "url": "https://example.com/review1",
-      "snippet": "Apple's iPhone 15 Pro features a titanium frame, making it lighter and more durable than previous models."
+      "url": "https://example.com/review1"
     }},
     {{
       "number": 2,
-      "url": "https://example.com/benchmarks",
-      "snippet": "The new A17 Pro chip in iPhone 15 Pro delivers 20% faster performance than its predecessor."
-    }},
-    {{
-      "number": 3,
-      "url": "https://example.com/cameras",
-      "snippet": "With its 48-megapixel main camera, the iPhone 15 Pro captures remarkable detail even in low-light conditions."
+      "url": "https://example.com/cameras"
     }}
   ]
 }}
 
-EXAMPLE 2:
-Response: "Climate change is accelerating with global temperatures rising. In the Arctic, ice is melting at an unprecedented rate, which contributes to rising sea levels. Many coastal cities are now implementing adaptation strategies."
+CRITICAL: 
+- Take special care to copy each URL EXACTLY as provided in the sources - do not modify, truncate, or reformat URLs
+- Check each URL carefully before including it in the references
+- URLs must be complete and functional to ensure proper citation links
 
-Sources: [
-  {{"id": 1, "title": "IPCC Report 2023", "url": "https://example.com/ipcc", "content": "Global temperatures have risen by 1.1°C since pre-industrial times, with the rate of warming accelerating in recent decades."}},
-  {{"id": 2, "title": "Arctic Ice Study", "url": "https://example.com/arctic", "content": "Arctic sea ice is now declining at a rate of 13.1% per decade, relative to the 1981-2010 average."}},
-  {{"id": 3, "title": "Sea Level Rise", "url": "https://example.com/sealevel", "content": "Sea levels rose by 20cm in the last century and are now rising at 3.7mm per year."}}
-]
-
-Output:
-{{
-  "cited_text": "Climate change is accelerating with global temperatures rising.[1] In the Arctic, ice is melting at an unprecedented rate,[2] which contributes to rising sea levels.[3] Many coastal cities are now implementing adaptation strategies.",
-  "references": [
-    {{
-      "number": 1,
-      "url": "https://example.com/ipcc",
-      "snippet": "Global temperatures have risen by 1.1°C since pre-industrial times, with the rate of warming accelerating in recent decades."
-    }},
-    {{
-      "number": 2,
-      "url": "https://example.com/arctic",
-      "snippet": "Arctic sea ice is now declining at a rate of 13.1% per decade, relative to the 1981-2010 average."
-    }},
-    {{
-      "number": 3,
-      "url": "https://example.com/sealevel",
-      "snippet": "Sea levels rose by 20cm in the last century and are now rising at 3.7mm per year."
-    }}
-  ]
-}}
-
-EXAMPLE 3:
-Response: "Python has been gaining popularity in recent years due to its simplicity and wide range of applications. Some developers prefer JavaScript for web development."
-
-Sources: [
-  {{"id": 1, "title": "Programming Language Survey", "url": "https://example.com/survey", "content": "Python has seen a 456% growth in popularity among developers between 2015 and 2023."}},
-  {{"id": 2, "title": "Web Dev Trends", "url": "https://example.com/webdev", "content": "Despite Python's growth, JavaScript remains the most used language for front-end web development."}}
-]
-
-Output:
-{{
-  "cited_text": "Python has been gaining popularity in recent years due to its simplicity and wide range of applications.[1] Some developers prefer JavaScript for web development.[2]",
-  "references": [
-    {{
-      "number": 1,
-      "url": "https://example.com/survey",
-      "snippet": "Python has seen a 456% growth in popularity among developers between 2015 and 2023."
-    }},
-    {{
-      "number": 2,
-      "url": "https://example.com/webdev",
-      "snippet": "Despite Python's growth, JavaScript remains the most used language for front-end web development."
-    }}
-  ]
-}}
-
-IMPORTANT: Only add citations where there is a clear match between the response text and a source. Do not invent or fabricate citations. Make sure to return valid JSON that can be parsed.
+Only add citations when there's a clear match between the text and sources. Return valid JSON.
 """
 
         citation_added_response = self.complete(
