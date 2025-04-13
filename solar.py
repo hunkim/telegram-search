@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 import re # Added for sentence splitting
 import json # Added for output formatting
+from collections import OrderedDict # Added for ordered mapping
 
 class SolarAPI:
     def __init__(self, api_key=os.getenv("UPSTAGE_API_KEY")):
@@ -191,26 +192,28 @@ Keep your tone friendly but efficient.
 
         # Prepare sources with numbers and pre-process content
         numbered_sources = []
+        source_details_map = {} # Map original number to details for later lookup
         for i, source in enumerate(sources):
             content_words = get_words(source.get('content'))
+            original_num = i + 1
             if content_words: # Only consider sources with processable content
-                numbered_sources.append({
-                    "number": i + 1,
+                details = {
+                    "number": original_num,
                     "url": source.get("url", ""),
                     "title": source.get("title", ""), # Keep title
                     "content_words": content_words
-                })
+                }
+                numbered_sources.append(details)
+                source_details_map[original_num] = details
 
         if not numbered_sources:
-             # Return original text if no sources had usable content
-            return json.dumps({"cited_text": response_text, "references": []})
+             return json.dumps({"cited_text": response_text, "references": []})
 
-
-        # Split text into sentences (basic regex, might need refinement)
+        # Split text into sentences
         sentences = re.split(r'(?<=[.!?])\s+', response_text)
-        cited_sentences = []
-        used_source_numbers = set()
-        overlap_threshold = 5 # Number of overlapping non-stop words to trigger citation
+        # List to hold sentences and their tentatively assigned *original* citation numbers
+        sentences_with_original_citations = []
+        overlap_threshold = 5 # Your chosen threshold
 
         for sentence in sentences:
             if not sentence.strip():
@@ -218,7 +221,7 @@ Keep your tone friendly but efficient.
 
             sentence_words = get_words(sentence)
             if not sentence_words:
-                 cited_sentences.append(sentence)
+                 sentences_with_original_citations.append({"text": sentence, "citations": []})
                  continue
 
             matching_source_nums = []
@@ -226,50 +229,74 @@ Keep your tone friendly but efficient.
                 overlap = sentence_words.intersection(source["content_words"])
                 if len(overlap) >= overlap_threshold:
                     matching_source_nums.append(source["number"])
-                    used_source_numbers.add(source["number"])
 
-            if matching_source_nums:
-                # Sort numbers for consistent citation order (e.g., [1][3])
-                matching_source_nums.sort()
-                citation_str = "".join([f"[{num}]" for num in matching_source_nums])
+            # Sort original numbers for consistent intermediate representation
+            matching_source_nums.sort()
+            sentences_with_original_citations.append({
+                "text": sentence,
+                "citations": matching_source_nums # Store original numbers
+            })
 
-                # --- Modification for citation placement ---
-                sentence_strip = sentence.rstrip() # Strip trailing whitespace only
+        # --- Reordering Logic ---
+        final_cited_sentences = []
+        old_to_new_mapping = OrderedDict() # Use OrderedDict to maintain insertion order
+        next_new_citation_num = 1
+        
+        # First pass: Find unique citations in order of appearance and build mapping
+        for sentence_data in sentences_with_original_citations:
+            for original_num in sentence_data["citations"]:
+                if original_num not in old_to_new_mapping:
+                    old_to_new_mapping[original_num] = next_new_citation_num
+                    next_new_citation_num += 1
+
+        # Second pass: Replace original numbers with new sequential numbers
+        for sentence_data in sentences_with_original_citations:
+            original_sentence_text = sentence_data["text"]
+            new_citation_nums = [old_to_new_mapping[orig_num] for orig_num in sentence_data["citations"]]
+
+            if new_citation_nums:
+                # Sort the *new* numbers for consistent display (e.g., [1][3], not [3][1])
+                new_citation_nums.sort()
+                citation_str = "".join([f"[{num}]" for num in new_citation_nums])
+
+                # Insert citation before trailing punctuation (same logic as before)
+                sentence_strip = original_sentence_text.rstrip()
                 trailing_punctuation = ""
-                # Check for standard trailing punctuation
                 if sentence_strip and sentence_strip[-1] in '.!?':
                     trailing_punctuation = sentence_strip[-1]
-                    # Remove punctuation and any space right before it
                     sentence_base = sentence_strip[:-1].rstrip()
                 else:
-                    # No standard punctuation found, use the stripped sentence as base
                     sentence_base = sentence_strip
 
-                # Append citation to the base text, then add punctuation back
                 cited_sentence = sentence_base + citation_str + trailing_punctuation
-                cited_sentences.append(cited_sentence)
-                # --- End Modification ---
+                final_cited_sentences.append(cited_sentence)
             else:
                 # Append original sentence if no citation needed
-                cited_sentences.append(sentence)
+                final_cited_sentences.append(original_sentence_text)
+        # --- End Reordering Logic ---
 
-        # Reconstruct the text
-        # Use the original sentence separators if possible, otherwise space.
-        # This requires capturing separators during split or a more robust join.
-        # For simplicity, we'll still use space joining for now.
-        cited_text = " ".join(cited_sentences)
+        # Reconstruct the final text
+        cited_text = " ".join(final_cited_sentences)
 
-        # Build references list for used sources
+        # Build references list using the new mapping
         references = []
-        for source in numbered_sources:
-            if source["number"] in used_source_numbers:
-                references.append({
-                    "number": source["number"],
-                    "url": source["url"],
-                    "title": source["title"] # Include title in reference
+        # Iterate through the mapping in the order citations were encountered
+        for original_num, new_num in old_to_new_mapping.items():
+            # Retrieve original source details using the original number
+            source_details = source_details_map.get(original_num)
+            if source_details:
+                 references.append({
+                    "number": new_num, # Use the new sequential number
+                    "url": source_details["url"],
+                    "title": source_details["title"]
                 })
-        # Ensure references are sorted by number
-        references.sort(key=lambda x: x["number"])
+            else:
+                 # Should not happen if logic is correct, but handle defensively
+                 print(f"Warning: Could not find details for original source number {original_num}")
+
+
+        # Ensure references are sorted by the new number (already implicitly sorted by OrderedDict iteration)
+        # references.sort(key=lambda x: x["number"]) # Technically redundant with OrderedDict
 
         # Return JSON structure
         result = {
@@ -280,8 +307,7 @@ Keep your tone friendly but efficient.
             return json.dumps(result, indent=2) # Pretty print JSON
         except Exception as e:
             print(f"Error serializing citation result to JSON: {e}")
-            # Fallback: return original text if JSON fails
-            return json.dumps({"cited_text": response_text, "references": []})
+            return json.dumps({"cited_text": response_text, "references": []}) # Fallback
 
 
     def fill_citation(self, response_text, sources, model="solar-mini-nightly"):
