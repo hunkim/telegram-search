@@ -2,6 +2,10 @@ import os
 import logging
 import asyncio
 import json
+from asyncio import Queue
+import time
+from urllib.parse import urlparse
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -59,226 +63,281 @@ class TelegramBot:
         )
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Process user's question using Solar API with grounding."""
+        """Process user's question using Solar API with grounding (Async Version)."""
         user_question = update.message.text
-        
-        # Show "Searching..." message
         status_message = await update.message.reply_text("🔍 Searching for information...")
-        
+
+        update_queue = Queue()
+        # Store a reference to avoid potential issues with `self` in the thread
+        solar_api_instance = self.solar_api 
+        loop = asyncio.get_running_loop() # Get loop in the main async context
+
+        def run_blocking_solar_call(question: str, queue: Queue):
+            """Runs the blocking Solar API call and puts updates onto the queue."""
+            try:
+                search_sources_holder = [] # Use a list to hold sources found by callback
+                final_text_pieces = [] # Collect pieces from stream callback
+
+                def sync_stream_callback(content: str):
+                    """Callback for stream updates (runs in API thread)."""
+                    if content:
+                        final_text_pieces.append(content)
+                        # Use the captured loop to put items onto the queue thread-safely
+                        loop.call_soon_threadsafe(queue.put_nowait, ('content', content))
+
+                def sync_search_done_callback(sources: list):
+                    """Callback for when search is done (runs in API thread)."""
+                    nonlocal search_sources_holder
+                    search_sources_holder.extend(sources) # Add sources to the holder
+                    # Use the captured loop to put items onto the queue thread-safely
+                    loop.call_soon_threadsafe(queue.put_nowait, ('sources', sources))
+
+                    # Optional: Print search sources in console for debugging
+                    if sources:
+                        print("\n=== SEARCH SOURCES (from thread) ===")
+                        for idx, source in enumerate(sources):
+                            print(f"Source {idx+1}: Title: {source.get('title', 'N/A')}, URL: {source.get('url', 'N/A')}")
+                        print("=====================\n")
+
+                # This call blocks until the API request (including streaming) is complete
+                solar_api_instance.complete(
+                    prompt=question,
+                    search_grounding=True,
+                    return_sources=True,
+                    stream=True,
+                    on_update=sync_stream_callback,
+                    search_done_callback=sync_search_done_callback
+                )
+
+                # Once complete() returns, signal completion with the final text and sources
+                final_text = "".join(final_text_pieces)
+                loop.call_soon_threadsafe(queue.put_nowait, ('done', {'text': final_text, 'sources': search_sources_holder}))
+
+            except Exception as e:
+                logger.error(f"Error in Solar API thread: {e}", exc_info=True)
+                loop.call_soon_threadsafe(queue.put_nowait, ('error', str(e)))
+
+
+        # Run the blocking function in a separate thread managed by asyncio
+        api_task = asyncio.create_task(asyncio.to_thread(
+            run_blocking_solar_call, user_question, update_queue
+        ))
+
+        accumulated_text = ""
+        sources = []
+        processing_done = False
+        error_message = None
+
+        # Throttling parameters
+        last_update_time = time.time()
+        last_update_length = 0
+        min_update_interval = 0.5  # Min seconds between edits
+        min_update_chars = 50      # Min new characters before attempting edit
+
         try:
-            # Create a thread-safe container with proper resource management
-            from threading import Lock
-            import time
-            
-            class ThreadSafeBuffer:
-                def __init__(self):
-                    self.buffer = ""
-                    self.lock = Lock()
-                    self.done = False  # Flag to indicate completion
-                
-                def append(self, content):
-                    with self.lock:
-                        self.buffer += content
-                        return len(self.buffer)
-                
-                def get(self):
-                    with self.lock:
-                        return self.buffer
-                        
-                def set_done(self):
-                    with self.lock:
-                        self.done = True
-                
-                def is_done(self):
-                    with self.lock:
-                        return self.done
-            
-            # Initialize our buffer and sources list
-            buffer = ThreadSafeBuffer()
-            sources = []
-            last_update_length = 0
-            
-            # Use an event to signal when search is done
-            from threading import Event
-            search_done_event = Event()
-            
-            # Callback for stream updates - this runs in a different thread
-            def handle_stream_update(content):
-                buffer.append(content)
-            
-            # Callback for when search is completed
-            def search_done_callback(search_sources):
-                nonlocal sources
-                sources = search_sources
-                
-                # Signal that search is complete
-                search_done_event.set()
-                
-                # Print search sources in console for debugging
-                if sources:
-                    print("\n=== SEARCH SOURCES ===")
-                    for idx, source in enumerate(sources):
-                        print(f"Source {idx+1}:")
-                        print(f"  Title: {source.get('title', 'N/A')}")
-                        print(f"  URL: {source.get('url', 'N/A')}")
-                        print(f"  Content: {source.get('content', 'N/A')[:100]}...")
-                    print("=====================\n")
-            
-            # Start the API call in a separate thread with proper timeout
-            import threading
-            api_thread = threading.Thread(
-                target=self.solar_api.complete,
-                kwargs={
-                    "prompt": user_question,
-                    "search_grounding": True,
-                    "return_sources": True,
-                    "stream": True,
-                    "on_update": handle_stream_update,
-                    "search_done_callback": search_done_callback
-                },
-                daemon=True  # Make it a daemon thread so it doesn't block shutdown
-            )
-            api_thread.start()
-            
-            # Track timing for updates to avoid overwhelming Telegram API
-            last_update_time = time.time()
-            update_interval = 0.1  # Minimum time between update attempts (seconds)
-            
-            # Set a timeout to prevent infinite waiting
-            timeout = 60  # 60 seconds max wait time
-            start_time = time.time()
-            
-            # Periodically check and update the message while the API call is running
-            while api_thread.is_alive() and time.time() - start_time < timeout:
-                current_text = buffer.get()
-                current_length = len(current_text)
-                current_time = time.time()
-                
-                # Update message if we have new content, enough time passed, and enough new chars
-                if (current_length > last_update_length and 
-                    current_length - last_update_length >= 70 and
-                    current_time - last_update_time >= update_interval):
-                    try:
-                        await status_message.edit_text(
-                            f"<b>Answer:</b> {current_text}",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
-                        )
-                        last_update_length = current_length
-                        last_update_time = current_time
-                    except Exception as e:
-                        print(f"Error updating message: {str(e)}")
-                
-                # Small sleep to prevent CPU hogging while still being responsive
-                await asyncio.sleep(0.05)
-            
-            # Get the final text
-            final_text = buffer.get()
-            
-            # If thread is still alive after timeout, we'll use what we have
-            if api_thread.is_alive():
-                print("Warning: API request timed out after", timeout, "seconds")
-                
-            # Wait for search results with a timeout
-            search_done_event.wait(timeout=10)  # Wait up to 10 seconds for search results
-            
-            # Send the final response if we have one
-            if final_text:
+            while not processing_done:
                 try:
-                    # First update with the complete response
-                    if len(final_text) > last_update_length:
+                    # Wait for updates from the queue with a timeout
+                    update_type, data = await asyncio.wait_for(update_queue.get(), timeout=90.0) # Increased timeout slightly
+
+                    if update_type == 'content':
+                        accumulated_text += data
+                        current_time = time.time()
+                        current_length = len(accumulated_text)
+
+                        # Check throttling conditions
+                        if (current_length > last_update_length and
+                            current_length - last_update_length >= min_update_chars and
+                            current_time - last_update_time >= min_update_interval):
+                            try:
+                                # Use a temporary status prefix during streaming
+                                await status_message.edit_text(
+                                    f"⏳<b>Answer:</b> {accumulated_text}...",
+                                    parse_mode="HTML",
+                                    disable_web_page_preview=True
+                                )
+                                last_update_length = current_length
+                                last_update_time = current_time
+                            except Exception as e:
+                                # Ignore potential transient errors like message not modified
+                                logger.warning(f"Error updating message (ignored): {e}")
+
+                    elif update_type == 'sources':
+                        # Sources are now received with 'done' message, 
+                        # but we could update status here if needed earlier
+                        pass 
+
+                    elif update_type == 'done':
+                        processing_done = True
+                        accumulated_text = data['text'] # Get final text from 'done' payload
+                        sources = data['sources']       # Get final sources from 'done' payload
+                        logger.info("API call processing finished successfully.")
+
+                    elif update_type == 'error':
+                        processing_done = True
+                        error_message = data
+                        logger.error(f"Error received from API thread: {error_message}")
+
+                    update_queue.task_done()
+
+                except asyncio.TimeoutError:
+                    logger.error("Timeout waiting for update from API queue.")
+                    error_message = "Request timed out while waiting for response."
+                    processing_done = True
+                    # Ensure the background task is cancelled if it's still running
+                    if not api_task.done():
+                        api_task.cancel()
+
+
+            # Final processing after the loop
+            if error_message:
+                 await status_message.edit_text(f"❌ Error generating answer: {error_message}")
+                 return # Stop processing on error
+
+            # Ensure the final accumulated text is displayed before citation
+            if len(accumulated_text) > 0: # Check if we actually got text
+                 try:
+                     await status_message.edit_text(
+                         f"⌛<b>Answer:</b> {accumulated_text}", # Indicate final pre-citation
+                         parse_mode="HTML",
+                         disable_web_page_preview=True
+                     )
+                     last_update_length = len(accumulated_text) # Update length for citation check
+                 except Exception as e:
+                     logger.warning(f"Error updating final pre-citation message (ignored): {e}")
+            else:
+                 # Handle case where API finished but returned no text
+                 await status_message.edit_text("No answer found for your query.")
+                 return
+
+
+            # Process citations if sources are available
+            if sources:
+                logger.info(f"Attempting citation processing with {len(sources)} sources.")
+                try:
+                    start_time = time.time()
+                    # Run blocking citation fill in a separate thread
+                    citation_result_json = await asyncio.to_thread(
+                        self.solar_api.fill_citation_heruistic,
+                        response_text=accumulated_text,
+                        sources=sources
+                    )
+
+                    logger.info(f"Done time: {time.time() - start_time}")
+                    logger.info(f"Citation result: {citation_result_json}")
+
+                    # Parse the citation result
+                    try:
+                        citation_data = json.loads(citation_result_json)
+                        cited_text = citation_data.get("cited_text", accumulated_text)
+                        references = citation_data.get("references", [])
+
+                        # Build the final message with citations and references
+                        final_message = f"✅<b>Answer:</b> {cited_text}"
+
+                        if references:
+                            final_message += "\n\n<b>Sources:</b>" # Add a newline before sources list
+                            source_links = []
+                            # Sort references by number for consistent ordering
+                            references.sort(key=lambda r: int(r.get("number", 0)))
+
+                            for ref in references:
+                                ref_num = ref.get("number", "")
+                                url = ref.get("url", "")
+                                title = ref.get("title", "") # Use title if available
+
+                                # Extract domain for display
+                                display_name = title if title else "Source" # Default to title or "Source"
+                                if url:
+                                    try:
+                                        domain = urlparse(url).netloc
+                                        if domain.startswith('www.'):
+                                            domain = domain[4:]
+                                        # Use domain if title is generic or missing
+                                        if not title or title.lower() in ["source", "untitled"]:
+                                            display_name = domain or "source"
+                                    except Exception:
+                                        pass # Keep default display_name if URL parsing fails
+                                
+                                # Ensure display name is not empty
+                                display_name = display_name or "source"
+
+                                # Create link only if URL is present
+                                if url:
+                                    source_links.append(f"[{ref_num}] <a href='{url}'>{display_name}</a>")
+                                else:
+                                    source_links.append(f"[{ref_num}] {display_name}")
+
+
+                            # Join sources with newlines for better readability
+                            final_message += "\n" + "\n".join(source_links)
+
+                        # Final update with citations
+                        # Check if cited text is meaningfully different before editing again
+                        if cited_text != accumulated_text or references:
+                            await status_message.edit_text(
+                                final_message,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True 
+                            )
+                            logger.info("Successfully updated message with citations.")
+                        else:
+                             logger.info("Cited text identical to original, skipping final edit.")
+
+
+                    except (json.JSONDecodeError, Exception) as e:
+                        logger.error(f"Error processing citation JSON: {e}", exc_info=True)
+                        # Fallback: Show the answer without citations if JSON processing failed
                         await status_message.edit_text(
-                            f"<b>Answer:</b> {final_text}",
+                            f"✅<b>Answer:</b> {accumulated_text}\n\n(Could not process citations)",
                             parse_mode="HTML",
                             disable_web_page_preview=True
                         )
-                    
-                    # If we have sources, add citations
-                    if False and sources:
-                        # Process citations synchronously
-                        citation_result = await asyncio.to_thread(
-                            self.solar_api.fill_citation,
-                            response_text=final_text,
-                            sources=sources
-                        )
-                        
-                        # Try to parse the citation result as JSON
-                        try:
-                            citation_data = json.loads(citation_result)
-                            cited_text = citation_data.get("cited_text", final_text)
-                            references = citation_data.get("references", [])
-                            
-                            # Build the final message with citations and references
-                            message = f"✅<b>Answer:</b> {cited_text}"
-                            
-                            if references:
-                                message += "\n"
-                                source_links = []
-                                
-                                for ref in references:
-                                    ref_num = ref.get("number", "")
-                                    url = ref.get("url", "")
-                                    
-                                    # Extract and clean domain name
-                                    try:
-                                        from urllib.parse import urlparse
-                                        full_domain = urlparse(url).netloc
-                                        
-                                        # Remove 'www.' prefix if present
-                                        if full_domain.startswith('www.'):
-                                            full_domain = full_domain[4:]
-                                            
-                                        # Extract main domain name (without TLD)
-                                        parts = full_domain.split('.')
-                                        if len(parts) >= 2:
-                                            # For domains like domain.com or domain.org
-                                            main_domain = parts[0]
-                                            
-                                            # For domains like domain.co.kr, get the main part
-                                            if len(parts) > 2 and parts[-2] in ['co', 'com', 'org', 'net', 'gov']:
-                                                main_domain = parts[-3]
-                                        else:
-                                            main_domain = full_domain
-                                    except:
-                                        # Fallback if parsing fails
-                                        main_domain = url.split("/")[2] if len(url.split("/")) > 2 else "source"
-                                        if main_domain.startswith('www.'):
-                                            main_domain = main_domain[4:]
-                                        main_domain = main_domain.split('.')[0]
-                                    
-                                    # Create hyperlinked domain name
-                                    source_links.append(f"[{ref_num}] <a href='{url}'>{main_domain}</a>")
-                                
-                                # Join all sources with commas in a single line
-                                message += ", ".join(source_links)
-                            
-                            # Update with the cited version
-                            await status_message.edit_text(
-                                message,
-                                parse_mode="HTML",
-                                disable_web_page_preview=True
-                            )
-                        except (json.JSONDecodeError, Exception) as e:
-                            print(f"Error processing citations: {str(e)}")
-                            # If citation processing fails, just keep the final text
+
                 except Exception as e:
-                    print(f"Error updating final message: {str(e)}")
-            
-            # If you want to add citations or further processing with the sources, do it here
-            
-        except Exception as e:
-            logger.error(f"Error generating answer: {str(e)}")
-            await status_message.edit_text(f"❌ Error generating answer: {str(e)}")
-    
-    async def update_to_thinking_state(self, context, source_count):
-        """Update the status message to indicate we're in the thinking state."""
-        status_message = context.user_data.get("status_message")
-        if status_message:
-            if source_count > 0:
-                await status_message.edit_text(f"🧠 Thinking... (Found {source_count} sources)")
+                    logger.error(f"Error during citation filling API call: {e}", exc_info=True)
+                    # Fallback: Show the answer without citations if API call failed
+                    await status_message.edit_text(
+                        f"✅<b>Answer:</b> {accumulated_text}\n\n(Citation generation failed)",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
             else:
-                await status_message.edit_text("🧠 Thinking...")
-    
+                # If no sources, ensure the final message state is correct
+                 await status_message.edit_text(
+                     f"✅<b>Answer:</b> {accumulated_text}",
+                     parse_mode="HTML",
+                     disable_web_page_preview=True
+                 )
+                 logger.info("Final message updated (no sources).")
+
+
+        except Exception as e:
+            # Catch-all for unexpected errors during the async processing
+            logger.error(f"Unhandled error in handle_text: {e}", exc_info=True)
+            try:
+                # Avoid editing if the message was deleted or inaccessible
+                if status_message:
+                    await status_message.edit_text(f"❌ An unexpected error occurred: {str(e)}")
+            except Exception as inner_e:
+                logger.error(f"Failed to send error message to user: {inner_e}")
+        finally:
+             # Ensure the background task is properly awaited or cancelled
+             if api_task and not api_task.done():
+                 logger.warning("API task still running on handle_text exit, cancelling.")
+                 api_task.cancel()
+                 try:
+                     await api_task # Wait for cancellation (suppresses CancelledError)
+                 except asyncio.CancelledError:
+                     logger.info("API task cancelled successfully on cleanup.")
+                 except Exception as e:
+                     logger.error(f"Error awaiting cancelled API task during cleanup: {e}")
+             elif api_task and api_task.done() and api_task.exception():
+                 # Log exception if task finished with an error wasn't handled before
+                 exc = api_task.exception()
+                 logger.error(f"API task finished with unhandled exception: {exc}", exc_info=exc)
+
+
     def run(self):
         """Start the bot."""
         self.application.run_polling()
