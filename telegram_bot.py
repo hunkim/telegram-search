@@ -66,13 +66,15 @@ class TelegramBot:
         status_message = await update.message.reply_text("🔍 Searching for information...")
         
         try:
-            # Create a thread-safe container for our response
+            # Create a thread-safe container with proper resource management
             from threading import Lock
+            import time
             
             class ThreadSafeBuffer:
                 def __init__(self):
                     self.buffer = ""
                     self.lock = Lock()
+                    self.done = False  # Flag to indicate completion
                 
                 def append(self, content):
                     with self.lock:
@@ -82,20 +84,35 @@ class TelegramBot:
                 def get(self):
                     with self.lock:
                         return self.buffer
+                        
+                def set_done(self):
+                    with self.lock:
+                        self.done = True
+                
+                def is_done(self):
+                    with self.lock:
+                        return self.done
             
             # Initialize our buffer and sources list
             buffer = ThreadSafeBuffer()
             sources = []
             last_update_length = 0
             
+            # Use an event to signal when search is done
+            from threading import Event
+            search_done_event = Event()
+            
             # Callback for stream updates - this runs in a different thread
             def handle_stream_update(content):
                 buffer.append(content)
             
             # Callback for when search is completed
-            def search_done(search_sources):
+            def search_done_callback(search_sources):
                 nonlocal sources
                 sources = search_sources
+                
+                # Signal that search is complete
+                search_done_event.set()
                 
                 # Print search sources in console for debugging
                 if sources:
@@ -107,7 +124,7 @@ class TelegramBot:
                         print(f"  Content: {source.get('content', 'N/A')[:100]}...")
                     print("=====================\n")
             
-            # Start the API call in a separate thread
+            # Start the API call in a separate thread with proper timeout
             import threading
             api_thread = threading.Thread(
                 target=self.solar_api.complete,
@@ -117,18 +134,30 @@ class TelegramBot:
                     "return_sources": True,
                     "stream": True,
                     "on_update": handle_stream_update,
-                    "search_done_callback": search_done
-                }
+                    "search_done_callback": search_done_callback
+                },
+                daemon=True  # Make it a daemon thread so it doesn't block shutdown
             )
             api_thread.start()
             
+            # Track timing for updates to avoid overwhelming Telegram API
+            last_update_time = time.time()
+            update_interval = 0.1  # Minimum time between update attempts (seconds)
+            
+            # Set a timeout to prevent infinite waiting
+            timeout = 60  # 60 seconds max wait time
+            start_time = time.time()
+            
             # Periodically check and update the message while the API call is running
-            while api_thread.is_alive():
+            while api_thread.is_alive() and time.time() - start_time < timeout:
                 current_text = buffer.get()
                 current_length = len(current_text)
+                current_time = time.time()
                 
-                # Update message if we have new content and it's been at least 50 chars
-                if current_length > last_update_length and current_length - last_update_length >= 50:
+                # Update message if we have new content, enough time passed, and enough new chars
+                if (current_length > last_update_length and 
+                    current_length - last_update_length >= 70 and
+                    current_time - last_update_time >= update_interval):
                     try:
                         await status_message.edit_text(
                             f"<b>Answer:</b> {current_text}",
@@ -136,17 +165,22 @@ class TelegramBot:
                             disable_web_page_preview=True
                         )
                         last_update_length = current_length
+                        last_update_time = current_time
                     except Exception as e:
                         print(f"Error updating message: {str(e)}")
                 
-                # Wait a short time before checking again
-                await asyncio.sleep(0.1)
-            
-            # Make sure the thread completes
-            api_thread.join()
+                # Small sleep to prevent CPU hogging while still being responsive
+                await asyncio.sleep(0.05)
             
             # Get the final text
             final_text = buffer.get()
+            
+            # If thread is still alive after timeout, we'll use what we have
+            if api_thread.is_alive():
+                print("Warning: API request timed out after", timeout, "seconds")
+                
+            # Wait for search results with a timeout
+            search_done_event.wait(timeout=10)  # Wait up to 10 seconds for search results
             
             # Send the final response if we have one
             if final_text:
@@ -160,7 +194,7 @@ class TelegramBot:
                         )
                     
                     # If we have sources, add citations
-                    if sources:
+                    if False and sources:
                         # Process citations synchronously
                         citation_result = await asyncio.to_thread(
                             self.solar_api.fill_citation,
