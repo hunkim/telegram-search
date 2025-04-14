@@ -21,7 +21,7 @@ class SolarAPI:
             "Content-Type": "application/json"
         }
     
-    def complete(self, prompt, model="solar-mini-nightly", stream=False, on_update=None, search_grounding=False, return_sources=False, search_done_callback=None):
+    def complete(self, prompt, model="solar-pro-nightly", stream=False, on_update=None, search_grounding=False, return_sources=False, search_done_callback=None):
         """Send a completion request to the Solar API.
         
         Args:
@@ -107,7 +107,7 @@ USER QUESTION: {prompt}
 IMPORTANT INSTRUCTIONS:
 1. Respond in the SAME LANGUAGE as the user's question. If the question is in Korean, respond in Korean.
 2. Be BRIEF and CONCISE - this is for Telegram, so get to the point clearly.
-3. Make FULL USE of the search results and cite relevant information.
+3. Make FULL USE of the search results and use terms from the search results in your response.
 4. Consider TIME-SENSITIVITY - today's date is {datetime.now().strftime("%Y-%m-%d")}.
 
 Provide a direct, informative answer based on the search results. If the search results don't contain relevant information, briefly state that you don't have sufficient information to answer the question.
@@ -349,7 +349,7 @@ Keep your tone friendly but efficient.
             return json.dumps({"cited_text": response_text, "references": []}) # Fallback
 
 
-    def fill_citation(self, response_text, sources, model="solar-mini-nightly"):
+    def fill_citation(self, response_text, sources, model="solar-pro-nightly"):
         prompt = f"""Add citation numbers to the response text where information comes from the provided sources.
 ---
 RESPONSE TEXT:
@@ -467,7 +467,7 @@ Only add citations when there's a clear match between the text and sources. Retu
         return full_content
 
 
-def extract_search_queries(user_prompt, max_attempts=3):
+def extract_search_queries(user_prompt, max_attempts=3, model="solar-pro-nightly"):
     """
     Extract 2-3 optimal search queries from a user prompt to maximize search engine relevance.
     
@@ -515,7 +515,7 @@ def extract_search_queries(user_prompt, max_attempts=3):
     for attempt in range(max_attempts):
         try:
             # Get completion from Solar API
-            response = solar.complete(prompt, model="solar-mini-nightly", stream=False)
+            response = solar.complete(prompt, model=model, stream=False)
             
             # Try to parse as JSON
             queries = json.loads(response)
