@@ -158,7 +158,7 @@ Keep your tone friendly but efficient.
         Adds citations to response text based on sources, only including relevant citation numbers.
         
         Args:
-            response_text (str): The response text with citation numbers like [1], [2]
+            response_text (str): The response text with citation numbers like [1], [2] or [4,9]
             sources (list): A list of source dictionaries
             
         Returns:
@@ -166,8 +166,14 @@ Keep your tone friendly but efficient.
         """
         try:
             # First check if response_text already contains citations
-            citation_pattern = r'\[(\d+)\]'
-            found_citations = set(int(match) for match in re.findall(citation_pattern, response_text))
+            # Match both single citations [1] and multiple citations [4,9]
+            citation_pattern = r'\[(\d+(?:,\s*\d+)*)\]'
+            found_citations = set()
+            
+            for match in re.findall(citation_pattern, response_text):
+                # Split multiple citations like "4,9" into individual numbers
+                for num in re.split(r',\s*', match):
+                    found_citations.add(int(num))
             
             # If no citations found, return original text with empty references
             if not found_citations:
