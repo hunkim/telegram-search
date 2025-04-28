@@ -8,20 +8,20 @@ import json # Added for output formatting
 from collections import OrderedDict # Added for ordered mapping
 
 class SolarAPI:
-    def __init__(self, api_key=os.getenv("UPSTAGE_API_KEY")):
+    def __init__(self, api_key=os.getenv("UPSTAGE_API_KEY"), base_url="https://api.upstage.ai/v1/chat/completions"):
         """Initialize the SolarAPI client with the API key.
         
         Args:
             api_key (str): Your Upstage API key
         """
         self.api_key = api_key
-        self.base_url = "https://api.upstage.ai/v1/chat/completions"
+        self.base_url = base_url
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
     
-    def complete(self, prompt, model="solar-pro-nightly", stream=False, on_update=None, search_grounding=False, return_sources=False, search_done_callback=None):
+    def complete(self, prompt, model=None, stream=False, on_update=None, search_grounding=False, return_sources=False, search_done_callback=None):
         """Send a completion request to the Solar API.
         
         Args:
@@ -108,7 +108,8 @@ IMPORTANT INSTRUCTIONS:
 1. Respond in the SAME LANGUAGE as the user's question. If the question is in Korean, respond in Korean.
 2. Be BRIEF and CONCISE - this is for Telegram, so get to the point clearly.
 3. Make FULL USE of the search results and use terms from the search results in your response.
-4. Consider TIME-SENSITIVITY - today's date is {datetime.now().strftime("%Y-%m-%d")}.
+4. Add citation numbers [1], [2], etc. directly after the specific word or sentence that uses information from the sources. Add citations only for highly relevant information derived from the sources.
+5. Consider TIME-SENSITIVITY - today's date is {datetime.now().strftime("%Y-%m-%d")}.
 
 Provide a direct, informative answer based on the search results. If the search results don't contain relevant information, briefly state that you don't have sufficient information to answer the question.
 
@@ -151,6 +152,46 @@ Keep your tone friendly but efficient.
             }
         else:
             return response_text
+    
+    def add_citations(self, response_text, sources):
+        """
+        Adds citations to response text based on sources, only including relevant citation numbers.
+        
+        Args:
+            response_text (str): The response text with citation numbers like [1], [2]
+            sources (list): A list of source dictionaries
+            
+        Returns:
+            dict: A dictionary with cited_text and filtered references
+        """
+        try:
+            # First check if response_text already contains citations
+            citation_pattern = r'\[(\d+)\]'
+            found_citations = set(int(match) for match in re.findall(citation_pattern, response_text))
+            
+            # If no citations found, return original text with empty references
+            if not found_citations:
+                return json.dumps({"cited_text": response_text, "references": []})
+            
+            # Filter sources to only include those referenced in text
+            filtered_references = []
+            for source in sources:
+                # Get the source ID/number
+                source_num = source.get('id', None)
+                if source_num is not None and source_num in found_citations:
+                    filtered_references.append({
+                        "number": source_num,
+                        "url": source.get("url", ""),
+                        "title": source.get("title", "")
+                    })
+            
+            return json.dumps({
+                "cited_text": response_text,
+                "references": filtered_references
+            })
+        except Exception as e:
+            print(f"Error in add_citations: {e}")
+            return json.dumps({"cited_text": response_text, "references": []})
     
     def fill_citation_heruistic(self, response_text, sources):
         """
@@ -566,6 +607,10 @@ def extract_search_queries(user_prompt, max_attempts=3, model="solar-pro-nightly
 # Example usage
 if __name__ == "__main__":
     import os
+
+    solar_r = SolarAPI(base_url="https://r-api.toy.x.upstage.ai/v1/chat/completions", api_key=os.environ.get("SOLAR_R_API_KEY"))
+    # Test Solar_r
+    print(solar_r.complete("What is the capital of France?", model=None, stream=False))
     
     # Get API key from environment variable
     api_key = os.environ.get("UPSTAGE_API_KEY")

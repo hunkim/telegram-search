@@ -4,6 +4,7 @@ import asyncio
 import json
 from asyncio import Queue
 import time
+import re
 from urllib.parse import urlparse
 
 from telegram import Update
@@ -26,7 +27,9 @@ logger = logging.getLogger(__name__)
 class TelegramBot:
     def __init__(self, token):
         self.application = Application.builder().token(token).build()
-        self.solar_api = SolarAPI()
+        #self.solar_api = SolarAPI()
+        self.solar_api = SolarAPI(base_url="https://r-api.toy.x.upstage.ai/v1/chat/completions", api_key=os.environ.get("SOLAR_R_API_KEY"))
+
         self._setup_handlers()
     
     def _setup_handlers(self):
@@ -62,6 +65,125 @@ class TelegramBot:
             help_text, parse_mode="HTML", disable_web_page_preview=True
         )
     
+    def _format_markdown_for_telegram(self, text: str) -> str:
+        """Convert common Markdown syntax to Telegram-compatible HTML format."""
+        # Handle bold text: **text** or __text__ -> <b>text</b>
+        text = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', lambda m: f'<b>{m.group(1) or m.group(2)}</b>', text)
+        
+        # Handle italic text: *text* or _text_ -> <i>text</i>
+        text = re.sub(r'\*(.*?)\*|_(.*?)_(?![*_])', lambda m: f'<i>{m.group(1) or m.group(2)}</i>', text)
+        
+        # Handle code blocks: ```text``` -> <pre>text</pre>
+        text = re.sub(r'```(.*?)```', lambda m: f'<pre>{m.group(1)}</pre>', text, flags=re.DOTALL)
+        
+        # Handle inline code: `text` -> <code>text</code>
+        text = re.sub(r'`(.*?)`', lambda m: f'<code>{m.group(1)}</code>', text)
+        
+        # Handle links: [text](url) -> <a href="url">text</a>
+        text = re.sub(r'\[(.*?)\]\((.*?)\)', lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
+        
+        # Process numbered lists with preservation of structure
+        def process_numbered_list(match):
+            number = match.group(1)
+            content = match.group(2)
+            return f"{number}. <b>{content}</b>\n"
+            
+        # Handle numbered lists with item title formatting (assumes format: "1. **Title** - content")
+        text = re.sub(r'(\d+)\.\s+\*\*(.*?)\*\*\s+(.*?)(?=\n\d+\.|\n\n|$)', 
+                      lambda m: f"{m.group(1)}. <b>{m.group(2)}</b>\n{m.group(3)}\n", 
+                      text, flags=re.DOTALL)
+        
+        # Handle bullet points with proper formatting
+        text = re.sub(r'^\s*[-*+]\s+(.*?)$', r'• \1', text, flags=re.MULTILINE)
+        
+        # Ensure proper paragraph breaks (double newlines)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Handle soft breaks (replace single newlines within paragraphs with space)
+        # text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+        
+        return text
+
+    def _clean_text(self, text: str) -> str:
+        """Clean text by formatting think tags and markdown into Telegram-compatible HTML."""
+        def escape_html(text):
+            """Escape HTML special characters."""
+            html_escape_table = {
+                "&": "&amp;",
+                '"': "&quot;",
+                "'": "&apos;",
+                ">": "&gt;",
+                "<": "&lt;",
+            }
+            return "".join(html_escape_table.get(c, c) for c in text)
+
+        def replace_think_section(match):
+            think_content = match.group(1).strip()
+            if not think_content:  # Skip empty thinking sections
+                return ""
+            # Format thinking content with markdown support
+            think_content = self._format_markdown_for_telegram(think_content)
+            # Format as a visually distinct section
+            return (
+                "\n\n🤔 <b>Reasoning:</b> (tap to copy)\n"
+                f"<pre>{think_content}</pre>\n"
+            )
+            
+        # Process structured restaurant lists before markdown formatting
+        text = self._format_restaurant_list(text)
+
+        # Handle think tags
+        text = re.sub(r'<think>(.*?)</think>', replace_think_section, text, flags=re.DOTALL)
+        
+        # Then format remaining text with markdown
+        text = self._format_markdown_for_telegram(text)
+        
+        # Clean up any remaining think tags
+        text = text.replace('<think>', '').replace('</think>', '')
+        
+        return text.strip()
+
+    def _format_restaurant_list(self, text: str) -> str:
+        """Process restaurant or numbered list patterns with proper formatting."""
+        # Pattern for numbered list items with titles and descriptions
+        # Example: 1. **Restaurant Name** (Location) - Description
+        pattern = r'(\d+)\.\s+\*\*(.*?)\*\*\s*(\(.*?\))?\s*(?:-|\n-)\s*(.*?)(?=\n\d+\.|\Z)'
+        
+        def format_restaurant_item(match):
+            number = match.group(1)
+            name = match.group(2)
+            location = match.group(3) or ""
+            description = match.group(4).strip()
+            
+            # Extract citation references like [1][2] and preserve them
+            citation_refs = re.findall(r'\[\d+\]', description)
+            if citation_refs:
+                citation_str = " ".join(citation_refs)
+                # Remove citations from main text to reposition them
+                description = re.sub(r'\[\d+\]', '', description)
+                # Clean up spacing after citation removal
+                description = re.sub(r'\s+', ' ', description)
+                description = description.strip()
+                # Add citation refs at the end of title line
+                location_with_citations = f"{location} {citation_str}".strip()
+            else:
+                location_with_citations = location
+            
+            # Format bullet points in description if they exist
+            description = re.sub(r'^\s*-\s+', '\n• ', description, flags=re.MULTILINE)
+            # Ensure description starts with newline for proper formatting
+            if not description.startswith('\n') and description:
+                description = '\n' + description
+                
+            # Format with line breaks for better readability
+            formatted_item = f"{number}. <b>{name}</b> {location}\n{description}\n"
+            return formatted_item
+            
+        # Apply pattern with flags to handle multiline entries
+        text = re.sub(pattern, format_restaurant_item, text, flags=re.DOTALL)
+        
+        return text
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process user's question using Solar API with grounding (Async Version)."""
         user_question = update.message.text
@@ -150,9 +272,11 @@ class TelegramBot:
                             current_length - last_update_length >= min_update_chars and
                             current_time - last_update_time >= min_update_interval):
                             try:
+                                # Clean the text before sending to Telegram
+                                cleaned_text = self._clean_text(accumulated_text)
                                 # Use a temporary status prefix during streaming
                                 await status_message.edit_text(
-                                    f"⏳<b>Answer:</b> {accumulated_text}...",
+                                    f"⏳<b>Answer:</b> {cleaned_text}...",
                                     parse_mode="HTML",
                                     disable_web_page_preview=True
                                 )
@@ -197,8 +321,10 @@ class TelegramBot:
             # Ensure the final accumulated text is displayed before citation
             if len(accumulated_text) > 0: # Check if we actually got text
                  try:
+                     # Clean the text before sending to Telegram
+                     cleaned_text = self._clean_text(accumulated_text)
                      await status_message.edit_text(
-                         f"⌛<b>Answer:</b> {accumulated_text}", # Indicate final pre-citation
+                         f"⌛<b>Answer:</b> {cleaned_text}", # Indicate final pre-citation
                          parse_mode="HTML",
                          disable_web_page_preview=True
                      )
@@ -218,7 +344,7 @@ class TelegramBot:
                     start_time = time.time()
                     # Run blocking citation fill in a separate thread
                     citation_result_json = await asyncio.to_thread(
-                        self.solar_api.fill_citation_heruistic,
+                        self.solar_api.add_citations,
                         response_text=accumulated_text,
                         sources=sources
                     )
@@ -230,6 +356,8 @@ class TelegramBot:
                     try:
                         citation_data = json.loads(citation_result_json)
                         cited_text = citation_data.get("cited_text", accumulated_text)
+                        # Clean the cited text before sending to Telegram
+                        cited_text = self._clean_text(cited_text)
                         references = citation_data.get("references", [])
 
                         # Build the final message with citations and references
@@ -271,6 +399,7 @@ class TelegramBot:
 
                             # Join sources with newlines for better readability
                             final_message += "\n" + "\n".join(source_links)
+
 
                         # Final update with citations
                         # Check if cited text is meaningfully different before editing again
