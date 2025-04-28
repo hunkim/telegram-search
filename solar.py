@@ -166,8 +166,12 @@ Keep your tone friendly but efficient.
         """
         try:
             # First check if response_text already contains citations
-            citation_pattern = r'\[(\d+)\]'
-            found_citations = set(int(match) for match in re.findall(citation_pattern, response_text))
+            citation_pattern = r'\[(\d+(?:,\s*\d+)*)\]'
+            found_citations = set()
+            for match in re.findall(citation_pattern, response_text):
+                # Handle both single numbers and comma-separated numbers
+                for num in re.split(r',\s*', match):
+                    found_citations.add(int(num))
             
             # If no citations found, return original text with empty references
             if not found_citations:

@@ -342,7 +342,7 @@ class TelegramBot:
                 logger.info(f"Attempting citation processing with {len(sources)} sources.")
                 try:
                     start_time = time.time()
-                    # Run blocking citation fill in a separate thread
+                    # Run blocking citation fill in a separate thread - this should be async
                     citation_result_json = await asyncio.to_thread(
                         self.solar_api.add_citations,
                         response_text=accumulated_text,
@@ -355,16 +355,23 @@ class TelegramBot:
                     # Parse the citation result
                     try:
                         citation_data = json.loads(citation_result_json)
-                        cited_text = citation_data.get("cited_text", accumulated_text)
-                        # Clean the cited text before sending to Telegram
-                        cited_text = self._clean_text(cited_text)
                         references = citation_data.get("references", [])
 
-                        # Build the final message with citations and references
-                        final_message = f"✅<b>Answer:</b> {cited_text}"
+                        # If no references were found from parsing, use the source data directly
+                        if not references and sources:
+                            logger.info("No citations found in text, using direct sources instead")
+                            references = []
+                            for idx, source in enumerate(sources):
+                                references.append({
+                                    "number": idx + 1,  # 1-based indexing for display
+                                    "url": source.get("url", ""),
+                                    "title": source.get("title", "")
+                                })
 
+                        # If there are references, send them as a separate message
                         if references:
-                            final_message += "\n\n<b>Sources:</b>" # Add a newline before sources list
+                            # Create the citations message
+                            citations_message = "<b>Sources:</b>"
                             source_links = []
                             # Sort references by number for consistent ordering
                             references.sort(key=lambda r: int(r.get("number", 0)))
@@ -387,8 +394,10 @@ class TelegramBot:
                                     except Exception:
                                         pass # Keep default display_name if URL parsing fails
                                 
-                                # Ensure display name is not empty
+                                # Ensure display name is not empty and escape HTML
                                 display_name = display_name or "source"
+                                # Basic HTML escaping to prevent parsing errors
+                                display_name = display_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
                                 # Create link only if URL is present
                                 if url:
@@ -396,49 +405,64 @@ class TelegramBot:
                                 else:
                                     source_links.append(f"[{ref_num}] {display_name}")
 
-
                             # Join sources with newlines for better readability
-                            final_message += "\n" + "\n".join(source_links)
+                            citations_message += "\n" + "\n".join(source_links)
 
-
-                        # Final update with citations
-                        # Check if cited text is meaningfully different before editing again
-                        if cited_text != accumulated_text or references:
-                            await status_message.edit_text(
-                                final_message,
-                                parse_mode="HTML",
-                                disable_web_page_preview=True 
-                            )
-                            logger.info("Successfully updated message with citations.")
+                            try:
+                                # Send citations as a separate message
+                                await update.message.reply_text(
+                                    citations_message,
+                                    parse_mode="HTML",
+                                    disable_web_page_preview=True
+                                )
+                                logger.info("Successfully sent citations as a separate message.")
+                            except Exception as send_error:
+                                logger.error(f"Error sending citations message: {send_error}")
+                                # Try without HTML parsing as a fallback
+                                try:
+                                    plain_message = "Sources:\n" + "\n".join([f"[{ref.get('number', '')}] {ref.get('title', 'Source')}: {ref.get('url', '')}" for ref in references])
+                                    await update.message.reply_text(
+                                        plain_message,
+                                        disable_web_page_preview=True
+                                    )
+                                    logger.info("Sent plaintext citations as fallback.")
+                                except Exception as plain_error:
+                                    logger.error(f"Failed to send plaintext citations: {plain_error}")
                         else:
-                             logger.info("Cited text identical to original, skipping final edit.")
-
+                            logger.info("No citations available to send.")
 
                     except (json.JSONDecodeError, Exception) as e:
                         logger.error(f"Error processing citation JSON: {e}", exc_info=True)
-                        # Fallback: Show the answer without citations if JSON processing failed
-                        await status_message.edit_text(
-                            f"✅<b>Answer:</b> {accumulated_text}\n\n(Could not process citations)",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
-                        )
+                        # Fallback to display sources directly if citation processing fails
+                        try:
+                            if sources:
+                                plain_message = "Sources:\n" + "\n".join([f"[{idx+1}] {source.get('title', 'Source')}: {source.get('url', '')}" for idx, source in enumerate(sources)])
+                                await update.message.reply_text(
+                                    plain_message,
+                                    disable_web_page_preview=True
+                                )
+                                logger.info("Sent plaintext sources as fallback after citation processing error.")
+                        except Exception as fallback_error:
+                            logger.error(f"Failed to send fallback sources: {fallback_error}")
+                        logger.info("Citation generation failed, but original answer remains intact.")
 
                 except Exception as e:
                     logger.error(f"Error during citation filling API call: {e}", exc_info=True)
-                    # Fallback: Show the answer without citations if API call failed
-                    await status_message.edit_text(
-                        f"✅<b>Answer:</b> {accumulated_text}\n\n(Citation generation failed)",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    # Fallback to display sources directly if citation filling API fails
+                    try:
+                        if sources:
+                            plain_message = "Sources:\n" + "\n".join([f"[{idx+1}] {source.get('title', 'Source')}: {source.get('url', '')}" for idx, source in enumerate(sources)])
+                            await update.message.reply_text(
+                                plain_message,
+                                disable_web_page_preview=True
+                            )
+                            logger.info("Sent plaintext sources as fallback after citation API error.")
+                    except Exception as fallback_error:
+                        logger.error(f"Failed to send fallback sources: {fallback_error}")
+                    logger.info("Citation generation failed, but original answer remains intact.")
             else:
-                # If no sources, ensure the final message state is correct
-                 await status_message.edit_text(
-                     f"✅<b>Answer:</b> {accumulated_text}",
-                     parse_mode="HTML",
-                     disable_web_page_preview=True
-                 )
-                 logger.info("Final message updated (no sources).")
+                # Original answer already displayed, no additional action needed for no sources case
+                logger.info("No sources available for citation generation.")
 
 
         except Exception as e:
