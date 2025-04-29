@@ -24,6 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BOT_NAME = os.getenv("TELEGRAM_BOT_NAME")
+
 class TelegramBot:
     def __init__(self, token):
         self.application = Application.builder().token(token).build()
@@ -187,6 +189,10 @@ class TelegramBot:
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process user's question using Solar API with grounding (Async Version)."""
         user_question = update.message.text
+
+        # remove bot name from the question
+        user_question = user_question.replace(BOT_NAME, "").strip()
+
         status_message = await update.message.reply_text("🔍 Searching for information...")
 
         update_queue = Queue()
