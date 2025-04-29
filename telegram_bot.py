@@ -24,8 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_NAME = os.getenv("TELEGRAM_BOT_NAME")
-
 class TelegramBot:
     def __init__(self, token):
         self.application = Application.builder().token(token).build()
@@ -188,12 +186,48 @@ class TelegramBot:
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Process user's question using Solar API with grounding (Async Version)."""
+        
+        # Check if this is a group chat and if the bot is tagged
+        is_group_chat = update.effective_chat.type in ["group", "supergroup"]
+        is_bot_mentioned = False
+
+        # Get the bot's username from context (always available)
+        bot_username = context.bot.username if context.bot else None
+        logger.info(f"Bot username: {bot_username}")
+
+        # Optionally, store it for future reference
+        if bot_username and not hasattr(self, 'bot_username'):
+            self.bot_username = bot_username
+            logger.info(f"Bot username detected: @{bot_username}")
+
+        # Also check for existing bot name in message
+        if bot_username and bot_username.lower() in update.message.text.lower():
+            is_bot_mentioned = True
+        
+        # For direct mentions using @ symbol
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == 'mention':
+                    mention = update.message.text[entity.offset:entity.offset + entity.length]
+                    if mention.lower() == f"@{bot_username.lower()}":
+                        is_bot_mentioned = True
+                        break
+        
+        # Skip processing for group messages where the bot isn't mentioned
+        if is_group_chat and not is_bot_mentioned:
+            logger.info(f"Skipping message in group chat - bot not mentioned: {update.message.text[:50]}...")
+            return
+        
+        # Process the message as normal
         user_question = update.message.text
-
-        # remove bot name from the question
-        user_question = user_question.replace(BOT_NAME, "").strip()
-
-        status_message = await update.message.reply_text("🔍 Searching for information...")
+        
+        # Remove bot name/username from the question for cleaner processing
+        if bot_username:
+            user_question = re.sub(f'@?{re.escape(bot_username)}', '', user_question, flags=re.IGNORECASE)
+        user_question = user_question.strip()
+        
+        # Proceed with the rest of the handler as before
+        status_message = await update.message.reply_text(f"🔍 Searching for {user_question[:30]}...")
 
         update_queue = Queue()
         # Store a reference to avoid potential issues with `self` in the thread
